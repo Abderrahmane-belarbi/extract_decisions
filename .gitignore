@@ -1,0 +1,28 @@
+# Private scans, OCR data, previews, and workbooks
+/decisions/
+/exports/
+/debug_pages/
+/.cache/
+
+# Document-specific configuration and corrections
+/page_groups.json
+/rotations.json
+/corrections.csv
+
+# Python environments, caches, and local configuration
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.env
+/.env.*
+!/.env.example
+
+# Editor and OS files
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
