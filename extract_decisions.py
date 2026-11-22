@@ -94,12 +94,13 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from prompts import CROP_PROMPT, SYSTEM_PROMPT
+from extraction_policy import POLICY_VERSION, mask_uncertain_fields
 
 
 
 # --------------------- EDITABLE SETTINGS ---------------------
 
-DEFAULT_MODEL = "qwen3.5:9b"  # smaller, CPU-friendly quantized model
+DEFAULT_MODEL = "gemma4:12b"  # Ex: qwen3.5:9b. smaller, CPU-friendly quantized model
 
 OLLAMA_URL = "http://127.0.0.1:11434"  # explicitly local, not a cloud service
 
@@ -107,15 +108,15 @@ PDF_DPI = 200
 
 MAX_SIDE = 1700  # pixels sent to model (not the PDF render resolution)
 
-NUM_CTX = 4096
+NUM_CTX = 12288  # Room for the detailed Arabic prompt, image tokens, and JSON output.
 
 NUM_PREDICT = 1600
 
-TIMEOUT_SECONDS = 900
+TIMEOUT_SECONDS = 3600  # CPU vision inference may exceed fifteen minutes per image.
 
 JPEG_QUALITY = 91
 
-CACHE_VERSION = "arabic-decisions-v3-2026-11-03"
+CACHE_VERSION = "arabic-decisions-v4-explicit-evidence"
 
 IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 
@@ -229,7 +230,8 @@ SCHEMA: dict[str, Any] = {
 
         "page_role": {"type": "string", "enum": sorted(PAGE_ROLES)},
 
-        "uncertain_fields": {"type": "array", "items": {"type": "string"}},
+        "uncertain_fields": {"type": "array", "items": {"type": "string", "enum": list(FIELDS)},
+                             "uniqueItems": True},
 
         **{key: {"type": "string"} for key in FIELDS},
 
@@ -402,6 +404,8 @@ def clean_model_result(raw: dict[str, Any]) -> dict[str, Any]:
 
         unsure = []
 
+    fields, unsure, candidates = mask_uncertain_fields(fields, unsure)
+
     return {
 
         "fields": fields,
@@ -412,7 +416,8 @@ def clean_model_result(raw: dict[str, Any]) -> dict[str, Any]:
 
         "readable": raw.get("readable") is True,
 
-        "uncertain_fields": [k for k in unsure if isinstance(k, str) and k in FIELDS],
+        "uncertain_fields": unsure,
+        "review_candidates": candidates,
 
     }
 
@@ -606,7 +611,8 @@ def encode_image(image: Image.Image, max_side: int) -> str:
 
 def ollama_call(model: str, image_b64: str, schema: dict[str, Any],
 
-                prompt: str, num_ctx: int, max_tokens: int) -> dict[str, Any]:
+                prompt: str, num_ctx: int, max_tokens: int,
+                request_timeout: int | None = None) -> dict[str, Any]:
 
     payload = {
 
@@ -648,10 +654,17 @@ def ollama_call(model: str, image_b64: str, schema: dict[str, Any],
 
     try:
 
-        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as res:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS if request_timeout is None else request_timeout) as res:
 
             response = json.load(res)
 
+    except TimeoutError as exc:
+        seconds = TIMEOUT_SECONDS if request_timeout is None else request_timeout
+        raise RuntimeError(
+            f"Ollama did not finish within {seconds} seconds. CPU vision inference can be slow. "
+            "Increase --request-timeout, or lower --max-side for a faster run with less image detail. "
+            "Avoid simultaneous OCR runs against the same local model."
+        ) from exc
     except urllib.error.HTTPError as exc:
 
         detail = exc.read().decode("utf-8", errors="replace")[:500]
@@ -712,7 +725,8 @@ def rotated_image(img: Image.Image, angle: int) -> Image.Image:
 
 def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
-               forced_angle: int | None, detail: bool) -> tuple[dict[str, Any], int, list[str], Image.Image]:
+               forced_angle: int | None, detail: bool,
+               request_timeout: int | None = None) -> tuple[dict[str, Any], int, list[str], Image.Image]:
 
     """Try likely orientations, and optional higher-detail crops for missing key fields."""
 
@@ -730,7 +744,7 @@ def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
             ollama_call(model, encode_image(upright_image, max_side), SCHEMA,
 
-                        SYSTEM_PROMPT, num_ctx, NUM_PREDICT)
+                        SYSTEM_PROMPT, num_ctx, NUM_PREDICT, request_timeout)
 
         )
 
@@ -792,7 +806,7 @@ def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
                 crop_data = ollama_call(model, encode_image(cropped, max_side), crop_schema,
 
-                                        CROP_PROMPT + "\nالمطلوب: " + ", ".join(keys), num_ctx, 500)
+                                        CROP_PROMPT + "\nالمطلوب: " + ", ".join(keys), num_ctx, 500, request_timeout)
 
                 for k in keys:
 
@@ -808,7 +822,7 @@ def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
                     elif v and norm(v) != norm(answer["fields"][k]):
 
-                        notes.append(f"اختلاف قراءة الصورة والقصاصة في الحقل: {k}")
+                        notes.append(f"اختلاف قراءة {k}: الصورة={answer['fields'][k]}؛ القصاصة={v}")
 
                         answer["uncertain_fields"].append(k)
 
@@ -816,6 +830,12 @@ def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
                 notes.append(f"فشل فحص قصاصة: {str(exc)[:90]}")
 
+    fields, unsure, candidates = mask_uncertain_fields(answer["fields"], answer["uncertain_fields"])
+    answer["fields"] = fields
+    answer["uncertain_fields"] = unsure
+    answer.setdefault("review_candidates", {}).update(candidates)
+    for key, value in answer["review_candidates"].items():
+        notes.append(f"قراءة غير مؤكدة مستبعدة من الحقل {key}: {value}")
     return answer, angle, notes, selected
 
 
@@ -824,11 +844,13 @@ def model_page(image: Image.Image, model: str, max_side: int, num_ctx: int,
 
 def cache_key(job: PageJob, model: str, dpi: int, max_side: int,
 
-              detail: bool, angle: int | None) -> str:
+              detail: bool, angle: int | None, num_ctx: int = NUM_CTX) -> str:
 
+    contract = json.dumps({"system": SYSTEM_PROMPT, "crop": CROP_PROMPT, "schema": SCHEMA,
+                           "policy": POLICY_VERSION}, ensure_ascii=False, sort_keys=True)
     parts = (CACHE_VERSION, job.file_hash, job.page, model, dpi, max_side, detail, angle,
-
-             NUM_CTX, NUM_PREDICT)
+             num_ctx, NUM_PREDICT, JPEG_QUALITY, OLLAMA_URL,
+             hashlib.sha256(contract.encode("utf-8")).hexdigest())
 
     return hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()
 
@@ -904,9 +926,16 @@ def validate_record(record: DecisionRecord) -> list[str]:
 
         cat = norm(f["category"]).lstrip("0") or "0"
 
-        if not cat.isdecimal() or not 1 <= int(cat) <= 16:
+        letter_category = len(cat) == 1 and "ء" <= cat <= "ي" and cat.isalpha()
+        numeric_category = cat.isdecimal() and 1 <= int(cat) <= 16
+        if not (letter_category or numeric_category):
 
-            warnings.append("الصنف خارج 1..16 أو غير رقمي؛ راجع المصدر")
+            warnings.append("الصنف ليس رقما من 1 إلى 16 أو حرفا عربيا مفردا؛ راجع المصدر")
+
+    if f["grade"]:
+        grade = norm(f["grade"])
+        if not grade.isdecimal() or not 1 <= int(grade) <= 12:
+            warnings.append("درجة الأقدمية خارج 1..12 أو غير رقمية؛ راجع المصدر")
 
     if f["gender"] and norm(f["gender"]) not in ("ذكر", "انثي", "انثى"):
 
@@ -1589,7 +1618,7 @@ def process(args: argparse.Namespace) -> tuple[list[DecisionRecord], list[tuple[
 
         cachefile = args.cache / (cache_key(job, args.model, args.pdf_dpi, args.max_side,
 
-                                            args.detail, forced_angle) + ".json")
+                                            args.detail, forced_angle, args.num_ctx) + ".json")
 
         cached = None if args.force else read_cache(cachefile)
 
@@ -1630,7 +1659,7 @@ def process(args: argparse.Namespace) -> tuple[list[DecisionRecord], list[tuple[
                     job,
                     lambda: model_page(
                         img, args.model, args.max_side, args.num_ctx,
-                        forced_angle, args.detail
+                        forced_angle, args.detail, args.request_timeout
                     ),
                     file_finished[job.path], file_totals[job.path],
                     total_finished, total_pages, expected_seconds,
@@ -1719,6 +1748,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-side", type=int, default=MAX_SIDE)
 
     parser.add_argument("--num-ctx", type=int, default=NUM_CTX)
+    parser.add_argument("--request-timeout", type=int, default=TIMEOUT_SECONDS,
+                        help="Maximum seconds per Ollama request (default: 3600 for slow CPU vision runs)")
 
     parser.add_argument("--limit", type=int, help="Process up to N *uncached* pages this run")
 
@@ -1735,6 +1766,8 @@ def arguments(argv: list[str] | None = None) -> argparse.Namespace:
     if args.limit is not None and args.limit < 1:
 
         parser.error("--limit must be a positive integer")
+    if args.request_timeout < 1:
+        parser.error("--request-timeout must be a positive integer")
 
     return args
 

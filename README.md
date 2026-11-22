@@ -61,9 +61,35 @@ Add `rotations.json` to set the orientation of a file or a specific PDF page. An
 }
 ```
 
-Use `--detail` to check cropped sections for missing fields. It makes additional model calls. Use `--force` to bypass cached results, including when testing a different `--num-ctx` value.
+Use `--detail` to check cropped sections for missing fields. It makes additional model calls. Readings recovered from crops and disagreements are flagged; their candidate values appear in review warnings rather than being treated as certain values.
+
+Changes to either prompt, the response schema, or the actual `--num-ctx` value automatically use a new cache key. Use `--force` to reread otherwise identical cached pages. Old cache files are retained. The default context is 12288 to leave more room for the detailed Arabic prompt and response; local model memory and speed still depend on the selected model and hardware.
+
+## Extraction policy
+
+Edit `SYSTEM_PROMPT` and `CROP_PROMPT` in `prompts.py`; the application imports them directly. Missing grades and effective dates stay empty. Grades are not calculated from index numbers. Arabic letter categories are accepted, and higher-function divisions (`القسم`) are not seniority grades. Ambiguous name splits leave both surname and given name empty while retaining a clearly readable full name. Uncertain values are kept as review candidates and omitted from extraction fields.
+
+## Compare prompts before training
+
+Use a fixed set of upright images with human-checked JSON answers. The local `evaluate_extraction.py` tool only evaluates reference rows whose `human_verified` flag is explicitly `true`. It does not treat assistant drafts as ground truth. It reports exact text accuracy, nonempty-field accuracy, unsupported fills, and omissions; fields still marked uncertain in the reference are skipped.
+
+For the private archive dataset, a proposed review set is in `exports/docs_training/evaluation/review_set.jsonl`. Correct each selected answer against its image before setting its `human_verified` flag. Then run:
+
+```powershell
+.\.venv\Scripts\python.exe evaluate_extraction.py --references exports/docs_training/evaluation/review_set.jsonl --image-root exports/docs_training --baseline-prompt exports/docs_training/history/before_explicit_evidence_v1/project_system_prompt.txt --output exports/docs_training/evaluation/results
+```
+
+Ollama must be running with the selected model installed. Both prompts use the same current extraction pipeline, context, and images, with crops disabled, so this compares the system prompts. It does not measure historical pipeline behavior or crop-prompt improvements. No training is started by this command.
+
+Run the regression checks with `.\.venv\Scripts\python.exe -m unittest discover -s tests -v`.
 
 On reruns, `--limit` counts completed OCR pages that were processed during the run. Cached pages can still appear in the workbook, and failed attempts can make the script try more pages than the limit.
+
+### CPU timeouts
+
+The default wait is 3600 seconds per Ollama request. On a CPU, the vision model may spend more than fifteen minutes processing a single full-size image. A longer prompt also adds processing time. Set `--request-timeout 7200` if a request needs a longer wait. This increases the allowed time; it does not speed up the model. A file can involve several requests for rotations or detail crops.
+
+Try `--limit 1` first and avoid running the evaluator and another OCR job simultaneously against the same CPU model. Reducing `--max-side` can speed up a run but may reduce small-text and stamp accuracy. Failed requests are not cached; completed pages remain cached.
 
 ## Save corrections between runs
 
